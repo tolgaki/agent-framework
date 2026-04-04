@@ -1,0 +1,23 @@
+[package]
+name = "agent-framework"
+description = "Microsoft Agent Framework for Rust - build, orchestrate, and deploy AI agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-framework-core.workspace = true
+
+[features]
+default = ["anthropic", "openai"]
+anthropic = ["dep:agent-framework-anthropic"]
+openai = ["dep:agent-framework-openai"]
+
+[dependencies.agent-framework-anthropic]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-openai]
+workspace = true
+optional = true

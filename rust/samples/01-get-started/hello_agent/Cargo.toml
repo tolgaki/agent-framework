@@ -1,0 +1,10 @@
+[package]
+name = "hello-agent"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agent-framework-core = { path = "../../../crates/agent-framework-core" }
+agent-framework-anthropic = { path = "../../../crates/agent-framework-anthropic" }
+tokio = { version = "1", features = ["full"] }

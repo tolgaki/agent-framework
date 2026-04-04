@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/agent-framework-core",
+    "crates/agent-framework-anthropic",
+    "crates/agent-framework-openai",
+    "crates/agent-framework",
+    "samples/01-get-started/hello_agent",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.75"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# HTTP
+reqwest = { version = "0.12", features = ["json", "stream"] }
+reqwest-eventsource = "0.6"
+
+# Error handling
+thiserror = "2"
+
+# Observability
+tracing = "0.1"
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+
+# Workspace crates
+agent-framework-core = { path = "crates/agent-framework-core" }
+agent-framework-anthropic = { path = "crates/agent-framework-anthropic" }
+agent-framework-openai = { path = "crates/agent-framework-openai" }
