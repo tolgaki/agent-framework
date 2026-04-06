@@ -24,13 +24,13 @@
 //! let agent = ChatClientAgent::builder()
 //!     .client(agent_framework::anthropic::AnthropicChatClient::new(
 //!         agent_framework::anthropic::AnthropicConfig::from_env()?,
-//!     ))
+//!     )?)
 //!     .instructions("You are a helpful assistant.")
 //!     .build()?;
 //!
 //! let mut session = AgentSession::new();
 //! # #[cfg(feature = "anthropic")]
-//! let response = agent.run(vec![Message::user("Hello!")], &mut session).await?;
+//! let response = agent.run(vec![Message::user("Hello!")], &mut session, None).await?;
 //! # #[cfg(feature = "anthropic")]
 //! println!("{}", response.text);
 //! # Ok(())

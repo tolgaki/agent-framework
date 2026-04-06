@@ -5,6 +5,10 @@ on:
     branches: ["main", "feature*"]
     paths:
       - "rust/**"
+  push:
+    branches: ["main"]
+    paths:
+      - "rust/**"
 
 jobs:
   rust-build-and-test:

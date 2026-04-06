@@ -7,4 +7,4 @@ publish = false
 [dependencies]
 agent-framework-core = { path = "../../../crates/agent-framework-core" }
 agent-framework-anthropic = { path = "../../../crates/agent-framework-anthropic" }
-tokio = { version = "1", features = ["full"] }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

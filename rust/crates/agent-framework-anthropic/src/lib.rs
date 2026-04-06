@@ -18,12 +18,12 @@
 //! # async fn example() -> agent_framework_core::error::AgentResult<()> {
 //! let config = AnthropicConfig::from_env()?;
 //! let agent = ChatClientAgent::builder()
-//!     .client(AnthropicChatClient::new(config))
+//!     .client(AnthropicChatClient::new(config)?)
 //!     .instructions("You are a helpful assistant.")
 //!     .build()?;
 //!
 //! let mut session = AgentSession::new();
-//! let response = agent.run(vec![Message::user("Hello!")], &mut session).await?;
+//! let response = agent.run(vec![Message::user("Hello!")], &mut session, None).await?;
 //! println!("{}", response.text);
 //! # Ok(())
 //! # }

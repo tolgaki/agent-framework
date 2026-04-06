@@ -4,6 +4,8 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::tools::ToolDefinition;
+
 /// The role of a message participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -191,6 +193,41 @@ pub enum FinishReason {
     ContentFilter,
 }
 
+/// How the model should format its response.
+///
+/// Mirrors Python's `response_format` and .NET's `ChatResponseFormat`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ResponseFormat {
+    /// Unconstrained text output (the default).
+    Text,
+    /// The model must respond with a syntactically valid JSON object.
+    JsonObject,
+    /// The model must respond with JSON conforming to the supplied schema.
+    JsonSchema {
+        name: String,
+        schema: serde_json::Value,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        strict: Option<bool>,
+    },
+}
+
+/// How the model should choose whether to call tools.
+///
+/// Mirrors Python's `tool_choice` and .NET's `ChatToolMode`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Let the model decide whether to call tools (default).
+    Auto,
+    /// Forbid tool calls this turn.
+    None,
+    /// Require the model to call at least one tool this turn.
+    Required,
+    /// Force the model to call this specific tool by name.
+    Specific { name: String },
+}
+
 /// Options for a chat completion request.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ChatOptions {
@@ -210,13 +247,110 @@ pub struct ChatOptions {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub top_p: Option<f32>,
 
+    /// Top-k sampling (Anthropic, Google, and some others).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+
+    /// Random seed for reproducible sampling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seed: Option<i64>,
+
+    /// Frequency penalty (-2.0 to 2.0). OpenAI-compatible providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f32>,
+
+    /// Presence penalty (-2.0 to 2.0). OpenAI-compatible providers.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f32>,
+
+    /// Logit bias: token id → bias value. OpenAI-compatible providers.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub logit_bias: HashMap<String, f32>,
+
+    /// Stable end-user identifier for abuse monitoring (OpenAI's `user` field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+
+    /// Required response format.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub response_format: Option<ResponseFormat>,
+
+    /// How the model should choose whether to call tools.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_choice: Option<ToolChoice>,
+
     /// Stop sequences.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stop_sequences: Vec<String>,
 
-    /// Additional provider-specific options.
+    /// Tools the model may call during this request.
+    ///
+    /// Mirrors `ChatOptions.Tools` in the .NET SDK and the `"tools"` key in the
+    /// Python SDK's options dict.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<ToolDefinition>,
+
+    /// Additional provider-specific options that don't map to a typed field.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub extra: HashMap<String, serde_json::Value>,
+}
+
+impl ChatOptions {
+    /// Merge `overrides` into a clone of `self`.
+    ///
+    /// For scalar/option fields, any `Some(..)` in `overrides` replaces the
+    /// value from `self`. For collection fields (`stop_sequences`, `tools`,
+    /// `logit_bias`, `extra`), a non-empty collection in `overrides` replaces
+    /// the one in `self`.
+    pub fn merge(&self, overrides: &ChatOptions) -> Self {
+        let mut out = self.clone();
+        if overrides.model.is_some() {
+            out.model = overrides.model.clone();
+        }
+        if overrides.max_tokens.is_some() {
+            out.max_tokens = overrides.max_tokens;
+        }
+        if overrides.temperature.is_some() {
+            out.temperature = overrides.temperature;
+        }
+        if overrides.top_p.is_some() {
+            out.top_p = overrides.top_p;
+        }
+        if overrides.top_k.is_some() {
+            out.top_k = overrides.top_k;
+        }
+        if overrides.seed.is_some() {
+            out.seed = overrides.seed;
+        }
+        if overrides.frequency_penalty.is_some() {
+            out.frequency_penalty = overrides.frequency_penalty;
+        }
+        if overrides.presence_penalty.is_some() {
+            out.presence_penalty = overrides.presence_penalty;
+        }
+        if !overrides.logit_bias.is_empty() {
+            out.logit_bias = overrides.logit_bias.clone();
+        }
+        if overrides.user.is_some() {
+            out.user = overrides.user.clone();
+        }
+        if overrides.response_format.is_some() {
+            out.response_format = overrides.response_format.clone();
+        }
+        if overrides.tool_choice.is_some() {
+            out.tool_choice = overrides.tool_choice.clone();
+        }
+        if !overrides.stop_sequences.is_empty() {
+            out.stop_sequences = overrides.stop_sequences.clone();
+        }
+        if !overrides.tools.is_empty() {
+            out.tools = overrides.tools.clone();
+        }
+        if !overrides.extra.is_empty() {
+            out.extra = overrides.extra.clone();
+        }
+        out
+    }
 }
 
 /// A complete response from a chat client.
@@ -321,4 +455,38 @@ pub struct AgentResponseUpdate {
 
     /// The underlying chat response update.
     pub inner: ChatResponseUpdate,
+}
+
+/// Per-call overrides for a single agent invocation.
+///
+/// Mirrors .NET's `AgentRunOptions` and Python's per-call kwargs. Any field
+/// left unset inherits the agent's default configured at build time.
+#[derive(Debug, Clone, Default)]
+pub struct AgentRunOptions {
+    /// Override individual [`ChatOptions`] fields for this call only. Only
+    /// `Some(...)` fields take effect; `None` fields keep the agent's defaults.
+    pub chat_options: Option<ChatOptions>,
+
+    /// Additional instructions prepended (as an extra system message) to the
+    /// agent's configured instructions for this call only.
+    pub additional_instructions: Option<String>,
+}
+
+impl AgentRunOptions {
+    /// Create an empty options struct (equivalent to [`Default::default`]).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set per-call [`ChatOptions`] overrides.
+    pub fn with_chat_options(mut self, options: ChatOptions) -> Self {
+        self.chat_options = Some(options);
+        self
+    }
+
+    /// Add extra system-level instructions for this call only.
+    pub fn with_additional_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.additional_instructions = Some(instructions.into());
+        self
+    }
 }

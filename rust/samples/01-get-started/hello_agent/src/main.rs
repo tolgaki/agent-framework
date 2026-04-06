@@ -26,7 +26,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build an agent backed by the Anthropic client.
     let agent = ChatClientAgent::builder()
-        .client(AnthropicChatClient::new(config))
+        .client(AnthropicChatClient::new(config)?)
         .name("HelloAgent")
         .instructions("You are a friendly assistant. Keep responses brief and cheerful.")
         .build()?;
@@ -37,6 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .run(
             vec![Message::user("Tell me a joke about Rust programming.")],
             &mut session,
+            None,
         )
         .await?;
 

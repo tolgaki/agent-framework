@@ -27,6 +27,10 @@ pub enum AgentError {
     #[error("HTTP error: {0}")]
     HttpError(String),
 
+    /// The requested feature is not yet implemented.
+    #[error("Unimplemented: {0}")]
+    Unimplemented(String),
+
     /// A generic boxed error for extensibility.
     #[error("{0}")]
     Other(#[from] Box<dyn std::error::Error + Send + Sync>),

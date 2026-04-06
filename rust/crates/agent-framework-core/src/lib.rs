@@ -29,7 +29,7 @@
 //!     .unwrap();
 //!
 //! let mut session = AgentSession::new();
-//! let response = agent.run(vec![Message::user("Hello!")], &mut session).await.unwrap();
+//! let response = agent.run(vec![Message::user("Hello!")], &mut session, None).await.unwrap();
 //! println!("{}", response.text);
 //! # }
 //! ```
@@ -38,7 +38,10 @@ pub mod agent;
 pub mod client;
 pub mod context;
 pub mod error;
+pub mod http_limits;
 pub mod middleware;
+pub mod redact;
+pub mod secret;
 pub mod session;
 pub mod streaming;
 pub mod tools;
@@ -48,6 +51,7 @@ pub mod types;
 pub use agent::{Agent, ChatClientAgent};
 pub use client::ChatClient;
 pub use error::{AgentError, AgentResult};
+pub use secret::SecretString;
 pub use session::AgentSession;
 pub use tools::{FunctionTool, ToolDefinition};
-pub use types::{AgentResponse, ChatOptions, ChatResponse, Content, Message, Role};
+pub use types::{AgentResponse, ChatOptions, ChatResponse, Content, Message, ResponseFormat, Role, ToolChoice};

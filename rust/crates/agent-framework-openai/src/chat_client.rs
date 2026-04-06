@@ -1,25 +1,37 @@
 // Copyright (c) Microsoft. All rights reserved.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::stream::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest_eventsource::{Event, EventSource, RequestBuilderExt};
 use serde::{Deserialize, Serialize};
+use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::error::{AgentError, AgentResult};
-use agent_framework_core::streaming::ResponseStream;
-use agent_framework_core::types::{ChatOptions, ChatResponse, Content, FinishReason, Message, Role, Usage};
+use agent_framework_core::http_limits::DEFAULT_MAX_RESPONSE_BYTES;
+use agent_framework_core::redact::scrub_error_body;
+use agent_framework_core::secret::SecretString;
+use agent_framework_core::streaming::{AbortOnDrop, AbortingStream, ResponseStream};
+use agent_framework_core::types::{
+    ChatOptions, ChatResponse, ChatResponseUpdate, Content, FinishReason, Message, ResponseFormat, Role,
+    ToolCallUpdate, ToolChoice, Usage,
+};
 
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 const DEFAULT_MAX_TOKENS: u32 = 4096;
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Configuration for the OpenAI chat client.
-#[derive(Debug, Clone)]
+#[derive(Clone, Debug)]
 pub struct OpenAIConfig {
-    /// OpenAI API key.
-    pub api_key: String,
+    /// OpenAI API key (redacted in `Debug`).
+    pub api_key: SecretString,
 
     /// Model identifier (e.g., "gpt-4o").
     pub model: String,
@@ -29,22 +41,30 @@ pub struct OpenAIConfig {
 
     /// Base URL for the API.
     pub base_url: String,
+
+    /// Overall request timeout. Defaults to 120 seconds.
+    pub request_timeout: Duration,
+
+    /// TCP connect timeout. Defaults to 10 seconds.
+    pub connect_timeout: Duration,
 }
 
 impl OpenAIConfig {
     /// Create a config from environment variables.
     ///
-    /// Reads `OPENAI_API_KEY` and optionally `OPENAI_MODEL`.
+    /// Reads `OPENAI_API_KEY` (required) and optionally `OPENAI_MODEL`.
     pub fn from_env() -> AgentResult<Self> {
         let api_key = std::env::var("OPENAI_API_KEY")
             .map_err(|_| AgentError::InvalidRequest("OPENAI_API_KEY environment variable is not set".to_string()))?;
         let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string());
 
         Ok(Self {
-            api_key,
+            api_key: SecretString::new(api_key),
             model,
             max_tokens: DEFAULT_MAX_TOKENS,
             base_url: DEFAULT_BASE_URL.to_string(),
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         })
     }
 }
@@ -57,11 +77,32 @@ pub struct OpenAIChatClient {
 
 impl OpenAIChatClient {
     /// Create a new OpenAI chat client.
-    pub fn new(config: OpenAIConfig) -> Self {
-        Self {
-            config,
-            http: reqwest::Client::new(),
-        }
+    ///
+    /// Returns an error if the underlying TLS backend cannot be initialised.
+    pub fn new(config: OpenAIConfig) -> AgentResult<Self> {
+        // `Policy::none()` is deliberate: reqwest's default redirect policy
+        // strips `Authorization` / `Cookie` on cross-origin hops, but a
+        // misconfigured `base_url` could still lead the `Authorization`
+        // header to an attacker-controlled host via a same-origin bounce.
+        // API calls should never follow redirects.
+        let http = reqwest::Client::builder()
+            .timeout(config.request_timeout)
+            .connect_timeout(config.connect_timeout)
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(|e| AgentError::InvalidRequest(format!("failed to build HTTP client: {e}")))?;
+        Ok(Self { config, http })
+    }
+
+    /// Build HTTP headers (Authorization + JSON content type) used for every request.
+    fn build_headers(&self) -> AgentResult<HeaderMap> {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        let mut auth = HeaderValue::from_str(&format!("Bearer {}", self.config.api_key.expose()))
+            .map_err(|_| AgentError::InvalidRequest("OPENAI_API_KEY contains invalid characters".to_string()))?;
+        auth.set_sensitive(true);
+        headers.insert(AUTHORIZATION, auth);
+        Ok(headers)
     }
 
     fn build_request_body(&self, messages: &[Message], options: Option<&ChatOptions>) -> OpenAIRequest {
@@ -74,22 +115,26 @@ impl OpenAIChatClient {
 
         let api_messages: Vec<OpenAIMessage> = messages.iter().map(message_to_openai).collect();
 
-        // Extract tool definitions.
-        let tools: Option<Vec<OpenAITool>> = options
-            .and_then(|o| o.extra.get("_tools"))
-            .and_then(|v| serde_json::from_value(v.clone()).ok())
-            .map(|defs: Vec<agent_framework_core::tools::ToolDefinition>| {
-                defs.into_iter()
-                    .map(|d| OpenAITool {
-                        r#type: "function".to_string(),
-                        function: OpenAIFunction {
-                            name: d.name,
-                            description: d.description,
-                            parameters: d.parameters_schema,
-                        },
-                    })
-                    .collect()
-            });
+        // Convert tool definitions (if any) to OpenAI's wire format.
+        let tools: Option<Vec<OpenAITool>> = options.and_then(|o| {
+            if o.tools.is_empty() {
+                None
+            } else {
+                Some(
+                    o.tools
+                        .iter()
+                        .map(|d| OpenAITool {
+                            r#type: "function".to_string(),
+                            function: OpenAIFunction {
+                                name: d.name.clone(),
+                                description: d.description.clone(),
+                                parameters: d.parameters_schema.clone(),
+                            },
+                        })
+                        .collect(),
+                )
+            }
+        });
 
         OpenAIRequest {
             model,
@@ -98,8 +143,50 @@ impl OpenAIChatClient {
             tools,
             temperature: options.and_then(|o| o.temperature),
             top_p: options.and_then(|o| o.top_p),
+            seed: options.and_then(|o| o.seed),
+            frequency_penalty: options.and_then(|o| o.frequency_penalty),
+            presence_penalty: options.and_then(|o| o.presence_penalty),
+            logit_bias: options.map(|o| o.logit_bias.clone()).filter(|b| !b.is_empty()),
+            user: options.and_then(|o| o.user.clone()),
+            response_format: options
+                .and_then(|o| o.response_format.as_ref())
+                .map(openai_response_format),
+            tool_choice: options.and_then(|o| o.tool_choice.as_ref()).map(openai_tool_choice),
             stop: options.map(|o| o.stop_sequences.clone()).filter(|s| !s.is_empty()),
+            stream: None,
+            stream_options: None,
         }
+    }
+}
+
+/// Convert a framework [`ResponseFormat`] to the OpenAI wire shape.
+fn openai_response_format(fmt: &ResponseFormat) -> serde_json::Value {
+    match fmt {
+        ResponseFormat::Text => serde_json::json!({"type": "text"}),
+        ResponseFormat::JsonObject => serde_json::json!({"type": "json_object"}),
+        ResponseFormat::JsonSchema { name, schema, strict } => {
+            let mut obj = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": { "name": name, "schema": schema }
+            });
+            if let Some(s) = strict {
+                obj["json_schema"]["strict"] = serde_json::json!(*s);
+            }
+            obj
+        }
+    }
+}
+
+/// Convert a framework [`ToolChoice`] to the OpenAI wire shape.
+fn openai_tool_choice(choice: &ToolChoice) -> serde_json::Value {
+    match choice {
+        ToolChoice::Auto => serde_json::json!("auto"),
+        ToolChoice::None => serde_json::json!("none"),
+        ToolChoice::Required => serde_json::json!("required"),
+        ToolChoice::Specific { name } => serde_json::json!({
+            "type": "function",
+            "function": { "name": name }
+        }),
     }
 }
 
@@ -111,18 +198,10 @@ impl ChatClient for OpenAIChatClient {
 
         debug!(model = %body.model, "Sending request to OpenAI");
 
-        let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(
-            AUTHORIZATION,
-            HeaderValue::from_str(&format!("Bearer {}", self.config.api_key))
-                .map_err(|e| AgentError::InvalidRequest(format!("Invalid API key: {e}")))?,
-        );
-
         let response = self
             .http
             .post(&url)
-            .headers(headers)
+            .headers(self.build_headers()?)
             .json(&body)
             .send()
             .await
@@ -132,27 +211,32 @@ impl ChatClient for OpenAIChatClient {
         if !status.is_success() {
             let error_text = response.text().await.unwrap_or_default();
             return Err(AgentError::provider(
-                format!("OpenAI API error ({status}): {error_text}"),
+                format!("OpenAI API error ({status}): {}", scrub_error_body(&error_text)),
                 Some(status.as_u16()),
             ));
         }
 
-        let api_response: OpenAIResponse = response
-            .json()
-            .await
-            .map_err(|e| AgentError::HttpError(e.to_string()))?;
-
+        let bytes = read_bounded_body(response, DEFAULT_MAX_RESPONSE_BYTES).await?;
+        let api_response: OpenAIResponse = serde_json::from_slice(&bytes)?;
         Ok(openai_response_to_chat_response(api_response))
     }
 
-    fn get_response_stream(
-        &self,
-        _messages: &[Message],
-        _options: Option<&ChatOptions>,
-    ) -> AgentResult<ResponseStream> {
-        Err(AgentError::InvalidRequest(
-            "Streaming not yet implemented for OpenAIChatClient".to_string(),
-        ))
+    fn get_response_stream(&self, messages: &[Message], options: Option<&ChatOptions>) -> AgentResult<ResponseStream> {
+        let mut body = self.build_request_body(messages, options);
+        body.stream = Some(true);
+        // Ask OpenAI to include usage in the final chunk.
+        body.stream_options = Some(StreamOptions { include_usage: true });
+        let url = format!("{}/chat/completions", self.config.base_url);
+
+        debug!(model = %body.model, "Opening OpenAI stream");
+
+        let request = self.http.post(&url).headers(self.build_headers()?).json(&body);
+
+        let event_source = request
+            .eventsource()
+            .map_err(|e| AgentError::HttpError(format!("failed to open event source: {e}")))?;
+
+        Ok(spawn_openai_stream(event_source))
     }
 }
 
@@ -171,7 +255,30 @@ struct OpenAIRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     top_p: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    logit_bias: Option<HashMap<String, f32>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -232,7 +339,7 @@ struct OpenAIResponseMessage {
     tool_calls: Option<Vec<OpenAIToolCall>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 struct OpenAIUsage {
     prompt_tokens: u32,
     completion_tokens: u32,
@@ -248,7 +355,7 @@ fn message_to_openai(msg: &Message) -> OpenAIMessage {
         Role::Tool => "tool",
     };
 
-    // Check for tool calls in the message.
+    // Collect tool calls from assistant messages.
     let tool_calls: Vec<_> = msg
         .content
         .iter()
@@ -268,17 +375,33 @@ fn message_to_openai(msg: &Message) -> OpenAIMessage {
         })
         .collect();
 
-    // Check for tool result.
-    let tool_call_id = msg.content.iter().find_map(|c| {
-        if let Content::ToolResult { tool_call_id, .. } = c {
-            Some(tool_call_id.clone())
-        } else {
-            None
-        }
-    });
+    // For tool messages, extract the tool_call_id and the result content.
+    // OpenAI requires both fields on a `tool`-role message.
+    let (tool_call_id, tool_result_content) = msg
+        .content
+        .iter()
+        .find_map(|c| {
+            if let Content::ToolResult { tool_call_id, content } = c {
+                Some((Some(tool_call_id.clone()), Some(content.clone())))
+            } else {
+                None
+            }
+        })
+        .unwrap_or((None, None));
 
-    let text = msg.text();
-    let content = if text.is_empty() { None } else { Some(text) };
+    // Build the content field. Tool messages use the tool_result text;
+    // other roles use the concatenated text content.
+    let content = match msg.role {
+        Role::Tool => tool_result_content,
+        _ => {
+            let text = msg.text();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+    };
 
     OpenAIMessage {
         role: role.to_string(),
@@ -286,6 +409,199 @@ fn message_to_openai(msg: &Message) -> OpenAIMessage {
         tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
         tool_call_id,
     }
+}
+
+/// Read an HTTP response body into memory with a hard byte cap.
+async fn read_bounded_body(response: reqwest::Response, max_bytes: usize) -> AgentResult<Vec<u8>> {
+    if let Some(len) = response.content_length() {
+        if len as u128 > max_bytes as u128 {
+            return Err(AgentError::HttpError(format!(
+                "response Content-Length {len} exceeds limit {max_bytes}"
+            )));
+        }
+    }
+    let mut buf = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| AgentError::HttpError(e.to_string()))?;
+        if buf.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(AgentError::HttpError(format!(
+                "response body exceeded {max_bytes} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(buf)
+}
+
+// ---- Streaming ----
+
+/// Spawn a task that drains an OpenAI SSE stream and forwards
+/// [`ChatResponseUpdate`] values into an mpsc channel. The spawned task
+/// is aborted as soon as the returned [`ResponseStream`] is dropped.
+fn spawn_openai_stream(mut event_source: EventSource) -> ResponseStream {
+    let (tx, rx) = tokio::sync::mpsc::channel::<AgentResult<ChatResponseUpdate>>(16);
+    let handle = tokio::spawn(async move {
+        // Tool calls stream as deltas keyed by `index`; we track id+name so we
+        // can attach them to each arguments-delta update.
+        let mut tool_call_index: HashMap<u32, (String, String)> = HashMap::new();
+
+        while let Some(event) = event_source.next().await {
+            match event {
+                Ok(Event::Open) => continue,
+                Ok(Event::Message(msg)) => {
+                    // OpenAI signals end-of-stream with a literal `[DONE]` payload.
+                    if msg.data == "[DONE]" {
+                        break;
+                    }
+                    match handle_openai_chunk(&msg.data, &mut tool_call_index) {
+                        Ok(updates) => {
+                            for update in updates {
+                                if tx.send(Ok(update)).await.is_err() {
+                                    event_source.close();
+                                    return;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            break;
+                        }
+                    }
+                }
+                Err(reqwest_eventsource::Error::StreamEnded) => break,
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(AgentError::HttpError(format!("SSE stream error: {e}"))))
+                        .await;
+                    break;
+                }
+            }
+        }
+        event_source.close();
+    });
+
+    let guard = AbortOnDrop::new(handle.abort_handle());
+    ResponseStream::new(AbortingStream::new(ReceiverStream::new(rx), guard))
+}
+
+/// Convert a single OpenAI chunk into zero or more `ChatResponseUpdate`s.
+fn handle_openai_chunk(
+    data: &str,
+    tool_call_index: &mut HashMap<u32, (String, String)>,
+) -> AgentResult<Vec<ChatResponseUpdate>> {
+    let chunk: OpenAIStreamChunk = serde_json::from_str(data)?;
+    let mut updates = Vec::new();
+
+    // Usage arrives on the final chunk (when stream_options.include_usage=true).
+    // That chunk has an empty `choices` array, so handle it before the choice loop.
+    if let Some(usage) = chunk.usage.clone() {
+        updates.push(ChatResponseUpdate {
+            text: None,
+            tool_call: None,
+            finish_reason: None,
+            usage: Some(Usage {
+                input_tokens: usage.prompt_tokens,
+                output_tokens: usage.completion_tokens,
+            }),
+        });
+    }
+
+    for choice in chunk.choices.into_iter() {
+        if let Some(content) = choice.delta.content {
+            if !content.is_empty() {
+                updates.push(ChatResponseUpdate {
+                    text: Some(content),
+                    tool_call: None,
+                    finish_reason: None,
+                    usage: None,
+                });
+            }
+        }
+
+        if let Some(tool_calls) = choice.delta.tool_calls {
+            for tc in tool_calls {
+                // First chunk for a given index carries id + function.name.
+                // Subsequent chunks carry additional argument fragments.
+                if let (Some(id), Some(function)) = (tc.id.clone(), tc.function.as_ref()) {
+                    let name = function.name.clone().unwrap_or_default();
+                    tool_call_index.insert(tc.index, (id, name));
+                }
+                let (id, name) = tool_call_index
+                    .get(&tc.index)
+                    .cloned()
+                    .unwrap_or_else(|| (String::new(), String::new()));
+                let arguments_delta = tc.function.and_then(|f| f.arguments).unwrap_or_default();
+                updates.push(ChatResponseUpdate {
+                    text: None,
+                    tool_call: Some(ToolCallUpdate {
+                        id,
+                        name,
+                        arguments_delta,
+                    }),
+                    finish_reason: None,
+                    usage: None,
+                });
+            }
+        }
+
+        if let Some(reason) = choice.finish_reason {
+            let mapped = match reason.as_str() {
+                "stop" => FinishReason::Stop,
+                "length" => FinishReason::MaxTokens,
+                "tool_calls" => FinishReason::ToolUse,
+                "content_filter" => FinishReason::ContentFilter,
+                _ => FinishReason::Stop,
+            };
+            updates.push(ChatResponseUpdate {
+                text: None,
+                tool_call: None,
+                finish_reason: Some(mapped),
+                usage: None,
+            });
+        }
+    }
+
+    Ok(updates)
+}
+
+#[derive(Deserialize)]
+struct OpenAIStreamChunk {
+    #[serde(default)]
+    choices: Vec<OpenAIStreamChoice>,
+    #[serde(default)]
+    usage: Option<OpenAIUsage>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIStreamChoice {
+    delta: OpenAIDelta,
+    finish_reason: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct OpenAIDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<OpenAIStreamToolCall>>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIStreamToolCall {
+    index: u32,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<OpenAIStreamFunctionCall>,
+}
+
+#[derive(Deserialize)]
+struct OpenAIStreamFunctionCall {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 fn openai_response_to_chat_response(resp: OpenAIResponse) -> ChatResponse {
@@ -311,8 +627,11 @@ fn openai_response_to_chat_response(resp: OpenAIResponse) -> ChatResponse {
 
     if let Some(tool_calls) = message.tool_calls {
         for tc in tool_calls {
-            let args: serde_json::Value =
-                serde_json::from_str(&tc.function.arguments).unwrap_or(serde_json::Value::Null);
+            // Preserve the raw argument string if the model returns invalid
+            // JSON, rather than silently becoming Null. The agent tool loop
+            // will surface an error to the model for malformed arguments.
+            let args: serde_json::Value = serde_json::from_str(&tc.function.arguments)
+                .unwrap_or_else(|_| serde_json::Value::String(tc.function.arguments.clone()));
             content_items.push(Content::tool_call(&tc.id, &tc.function.name, args));
         }
     }
@@ -342,5 +661,105 @@ fn openai_response_to_chat_response(resp: OpenAIResponse) -> ChatResponse {
         response_id: Some(resp.id),
         finish_reason,
         usage,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use agent_framework_core::types::Content;
+
+    #[test]
+    fn tool_role_message_populates_content_field() {
+        // Regression: msg.text() only extracts Content::Text, so tool-result
+        // messages used to serialize with content: null.
+        let msg = Message::tool_result("call_123", "the sky is blue");
+        let oa = message_to_openai(&msg);
+        assert_eq!(oa.role, "tool");
+        assert_eq!(oa.tool_call_id.as_deref(), Some("call_123"));
+        assert_eq!(oa.content.as_deref(), Some("the sky is blue"));
+        assert!(oa.tool_calls.is_none());
+    }
+
+    #[test]
+    fn assistant_message_with_tool_calls_serializes_correctly() {
+        let msg = Message {
+            role: Role::Assistant,
+            content: vec![
+                Content::text("let me check"),
+                Content::tool_call("call_1", "get_weather", serde_json::json!({"city": "Seattle"})),
+            ],
+            name: None,
+            metadata: HashMap::new(),
+        };
+        let oa = message_to_openai(&msg);
+        assert_eq!(oa.role, "assistant");
+        assert_eq!(oa.content.as_deref(), Some("let me check"));
+        let calls = oa.tool_calls.expect("tool_calls should be present");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].id, "call_1");
+        assert_eq!(calls[0].function.name, "get_weather");
+        assert!(calls[0].function.arguments.contains("Seattle"));
+    }
+
+    #[test]
+    fn user_message_text_goes_to_content() {
+        let msg = Message::user("hello");
+        let oa = message_to_openai(&msg);
+        assert_eq!(oa.role, "user");
+        assert_eq!(oa.content.as_deref(), Some("hello"));
+        assert!(oa.tool_calls.is_none());
+        assert!(oa.tool_call_id.is_none());
+    }
+
+    #[test]
+    fn tools_from_chat_options_serialize() {
+        use agent_framework_core::tools::ToolDefinition;
+
+        let config = OpenAIConfig {
+            api_key: SecretString::new("sk-test"),
+            model: "gpt-4o".into(),
+            max_tokens: 100,
+            base_url: "https://example.invalid".into(),
+            request_timeout: Duration::from_secs(10),
+            connect_timeout: Duration::from_secs(1),
+        };
+        let client = OpenAIChatClient::new(config).expect("client builds in tests");
+
+        let options = ChatOptions {
+            tools: vec![ToolDefinition::no_params("ping", "Ping")],
+            ..Default::default()
+        };
+
+        let body = client.build_request_body(&[Message::user("hi")], Some(&options));
+        let tools = body.tools.expect("tools should be serialized");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].function.name, "ping");
+    }
+
+    #[test]
+    fn stream_chunk_accumulates_tool_calls() {
+        let mut index = HashMap::new();
+        // First chunk has id + name + partial args.
+        let first = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"lookup","arguments":"{\"q"}}]}, "finish_reason":null}]}"#;
+        let updates = handle_openai_chunk(first, &mut index).unwrap();
+        assert_eq!(updates.len(), 1);
+        let tc = updates[0].tool_call.as_ref().unwrap();
+        assert_eq!(tc.id, "call_x");
+        assert_eq!(tc.name, "lookup");
+        assert_eq!(tc.arguments_delta, "{\"q");
+
+        // Continuation chunk only has the index + more arg chars.
+        let second = r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\":1}"}}]}, "finish_reason":null}]}"#;
+        let updates = handle_openai_chunk(second, &mut index).unwrap();
+        let tc = updates[0].tool_call.as_ref().unwrap();
+        assert_eq!(tc.id, "call_x");
+        assert_eq!(tc.name, "lookup");
+        assert_eq!(tc.arguments_delta, "\":1}");
+
+        // Final chunk: tool_calls finish reason.
+        let done = r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#;
+        let updates = handle_openai_chunk(done, &mut index).unwrap();
+        assert!(updates.iter().any(|u| u.finish_reason == Some(FinishReason::ToolUse)));
     }
 }
