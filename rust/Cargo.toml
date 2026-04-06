@@ -6,6 +6,10 @@ members = [
     "crates/agent-framework-openai",
     "crates/agent-framework",
     "samples/01-get-started/hello_agent",
+    "samples/02-add-tools/weather_agent",
+    "samples/03-multi-turn/conversation",
+    "samples/04-streaming/stream_agent",
+    "samples/05-middleware/logging",
 ]
 
 [workspace.package]
