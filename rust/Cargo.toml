@@ -5,11 +5,34 @@ members = [
     "crates/agent-framework-anthropic",
     "crates/agent-framework-openai",
     "crates/agent-framework",
+    "crates/agent-framework-evaluation",
+    "crates/agent-framework-telemetry",
+    "crates/agent-framework-mcp",
+    "crates/agent-framework-workflows",
+    "crates/agent-framework-orchestrations",
+    "crates/agent-framework-ollama",
+    "crates/agent-framework-declarative",
+    "crates/agent-framework-cosmos",
+    "crates/agent-framework-redis",
+    "crates/agent-framework-a2a",
+    "crates/agent-framework-hosting",
+    "crates/agent-framework-devui",
+    "crates/agent-framework-agui",
+    "crates/agent-framework-purview",
+    "crates/agent-framework-foundry",
+    "crates/agent-framework-azure-persistent",
+    "crates/agent-framework-copilot-studio",
+    "crates/agent-framework-github-copilot",
+    "crates/agent-framework-mem0",
+    "crates/agent-framework-durabletask",
+    "crates/agent-framework-hosting-azfunc",
+    "crates/agent-framework-workflows-declarative",
     "samples/01-get-started/hello_agent",
     "samples/02-add-tools/weather_agent",
     "samples/03-multi-turn/conversation",
     "samples/04-streaming/stream_agent",
     "samples/05-middleware/logging",
+    "samples/06-openai/hello_openai",
 ]
 
 [workspace.package]
@@ -20,7 +43,7 @@ rust-version = "1.75"
 
 [workspace.dependencies]
 # Async runtime
-tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros"] }
+tokio = { version = "1", default-features = false, features = ["rt", "sync", "macros", "time"] }
 tokio-stream = { version = "0.1", default-features = false, features = ["sync"] }
 async-trait = "0.1"
 async-stream = "0.3"
@@ -43,8 +66,45 @@ tracing = "0.1"
 # Utilities
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+base64 = "0.22"
+
+# Web server
+axum = { version = "0.8", features = ["json"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "fs"] }
+
+# Redis
+redis = { version = "0.29", features = ["aio", "tokio-comp"] }
+
+# A2A Protocol
+a2a-rs-core = "=1.0.17"
+a2a-rs-server = "=1.0.17"
+a2a-rs-client = "=1.0.17"
+anyhow = "1"
 
 # Workspace crates
 agent-framework-core = { path = "crates/agent-framework-core" }
 agent-framework-anthropic = { path = "crates/agent-framework-anthropic" }
 agent-framework-openai = { path = "crates/agent-framework-openai" }
+agent-framework-evaluation = { path = "crates/agent-framework-evaluation" }
+agent-framework-telemetry = { path = "crates/agent-framework-telemetry" }
+agent-framework-mcp = { path = "crates/agent-framework-mcp" }
+agent-framework-workflows = { path = "crates/agent-framework-workflows" }
+agent-framework-orchestrations = { path = "crates/agent-framework-orchestrations" }
+agent-framework-ollama = { path = "crates/agent-framework-ollama" }
+agent-framework-declarative = { path = "crates/agent-framework-declarative" }
+agent-framework-cosmos = { path = "crates/agent-framework-cosmos" }
+agent-framework-redis = { path = "crates/agent-framework-redis" }
+agent-framework-a2a = { path = "crates/agent-framework-a2a" }
+agent-framework-hosting = { path = "crates/agent-framework-hosting" }
+agent-framework-devui = { path = "crates/agent-framework-devui" }
+agent-framework-agui = { path = "crates/agent-framework-agui" }
+agent-framework-purview = { path = "crates/agent-framework-purview" }
+agent-framework-foundry = { path = "crates/agent-framework-foundry" }
+agent-framework-azure-persistent = { path = "crates/agent-framework-azure-persistent" }
+agent-framework-copilot-studio = { path = "crates/agent-framework-copilot-studio" }
+agent-framework-github-copilot = { path = "crates/agent-framework-github-copilot" }
+agent-framework-mem0 = { path = "crates/agent-framework-mem0" }
+agent-framework-durabletask = { path = "crates/agent-framework-durabletask" }
+agent-framework-hosting-azfunc = { path = "crates/agent-framework-hosting-azfunc" }
+agent-framework-workflows-declarative = { path = "crates/agent-framework-workflows-declarative" }

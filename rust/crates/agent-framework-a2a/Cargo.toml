@@ -1,0 +1,23 @@
+[package]
+name = "agent-framework-a2a"
+description = "Agent-to-Agent (A2A) protocol integration for the Microsoft Agent Framework, built on a2a-rs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-framework-core.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+anyhow.workspace = true
+
+# Real A2A protocol implementation
+a2a-rs-core.workspace = true
+a2a-rs-server.workspace = true
+a2a-rs-client.workspace = true

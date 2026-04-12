@@ -40,7 +40,10 @@ impl SecretString {
     /// that care about that should use [`expose`](Self::expose) and copy
     /// into their own zeroizing container instead.
     pub fn into_inner(self) -> String {
-        // Avoid running our Drop (which would zeroize).
+        // ManuallyDrop suppresses our Drop impl. mem::take moves the inner
+        // String out, leaving an empty String in ManuallyDrop (which is then
+        // leaked — no harm since it's empty). The caller now owns an ordinary
+        // String whose memory is NOT zeroized on drop.
         std::mem::take(&mut std::mem::ManuallyDrop::new(self).0)
     }
 }

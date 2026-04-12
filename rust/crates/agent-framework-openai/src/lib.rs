@@ -10,3 +10,9 @@
 mod chat_client;
 
 pub use chat_client::{OpenAIChatClient, OpenAIConfig};
+
+/// Azure OpenAI provider (feature-gated).
+#[cfg(feature = "azure")]
+pub mod azure;
+#[cfg(feature = "azure")]
+pub use azure::{AzureAuth, AzureOpenAIChatClient, AzureOpenAIConfig};

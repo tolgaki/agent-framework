@@ -37,7 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 "required": ["city"]
             }),
-        ),
+        )?,
         |args| async move {
             let city = args["city"].as_str().unwrap_or("unknown");
             // In a real app this would call an API. Here we return mock data.

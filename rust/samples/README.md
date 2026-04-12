@@ -44,6 +44,12 @@ Runnable examples organized by complexity, mirroring the Python and .NET SDK sam
 |--------|---------|-------------|
 | [Logging Middleware](./05-middleware/logging/) | `cargo run -p logging-middleware` | Add timing middleware at the agent level and function level to observe execution flow. |
 
+### 06 — OpenAI Provider
+
+| Sample | Command | Description |
+|--------|---------|-------------|
+| [Hello OpenAI](./06-openai/hello_openai/) | `cargo run -p hello-openai` | Minimal single-turn agent conversation using the OpenAI provider. |
+
 ## Running a sample
 
 From the `rust/` directory:

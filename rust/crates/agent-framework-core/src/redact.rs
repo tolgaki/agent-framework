@@ -13,9 +13,11 @@ pub const MAX_ERROR_BODY_LEN: usize = 2048;
 
 /// Well-known prefixes for credentials that might accidentally land in an
 /// error body (e.g. if a misconfigured proxy echoes request headers).
-const SECRET_PREFIXES: &[&str] = &[
-    "Bearer ", "bearer ", "sk-", "sk_", "xoxb-", "xoxp-", "ghp_", "ghs_", "AKIA",
-];
+/// Case-sensitive secret prefixes checked verbatim.
+const SECRET_PREFIXES: &[&str] = &["sk-", "sk_", "xoxb-", "xoxp-", "ghp_", "ghs_", "AKIA"];
+
+/// Prefixes that are compared case-insensitively (e.g., "Bearer", "BEARER", "bearer").
+const SECRET_PREFIXES_CI: &[&str] = &["Bearer "];
 
 /// Trim `body` to at most [`MAX_ERROR_BODY_LEN`] bytes and replace any token
 /// immediately following a known secret prefix with `[REDACTED]`.
@@ -47,35 +49,56 @@ fn scrub_secrets(s: &str) -> String {
     let mut i = 0;
     while i < bytes.len() {
         let mut matched = false;
+
+        // Case-sensitive prefixes.
         for prefix in SECRET_PREFIXES {
             let pb = prefix.as_bytes();
             if i + pb.len() <= bytes.len() && &bytes[i..i + pb.len()] == pb {
-                // Emit the prefix and redact until the next whitespace/delimiter.
-                out.push_str(prefix);
-                let mut j = i + pb.len();
-                while j < bytes.len() {
-                    let b = bytes[j];
-                    if b.is_ascii_whitespace() || b == b'"' || b == b'\'' || b == b',' || b == b'}' || b == b')' {
-                        break;
-                    }
-                    j += 1;
-                }
-                if j > i + pb.len() {
-                    out.push_str("[REDACTED]");
-                }
-                i = j;
+                redact_after_prefix(&mut out, bytes, &mut i, prefix);
                 matched = true;
                 break;
             }
         }
+
+        // Case-insensitive prefixes (e.g., "Bearer " in any casing).
         if !matched {
-            // Push the next char (ASCII fast-path falls back for UTF-8).
+            for prefix in SECRET_PREFIXES_CI {
+                let pb = prefix.as_bytes();
+                if i + pb.len() <= bytes.len()
+                    && bytes[i..i + pb.len()].eq_ignore_ascii_case(pb)
+                {
+                    let original = &s[i..i + pb.len()];
+                    redact_after_prefix(&mut out, bytes, &mut i, original);
+                    matched = true;
+                    break;
+                }
+            }
+        }
+
+        if !matched {
             let ch = s[i..].chars().next().unwrap();
             out.push(ch);
             i += ch.len_utf8();
         }
     }
     out
+}
+
+/// Emit `prefix` then replace the following token with `[REDACTED]`.
+fn redact_after_prefix(out: &mut String, bytes: &[u8], i: &mut usize, prefix: &str) {
+    out.push_str(prefix);
+    let mut j = *i + prefix.len();
+    while j < bytes.len() {
+        let b = bytes[j];
+        if b.is_ascii_whitespace() || b == b'"' || b == b'\'' || b == b',' || b == b'}' || b == b')' {
+            break;
+        }
+        j += 1;
+    }
+    if j > *i + prefix.len() {
+        out.push_str("[REDACTED]");
+    }
+    *i = j;
 }
 
 #[cfg(test)]

@@ -71,6 +71,68 @@ impl Default for AgentSession {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Serialization / deserialization — mirrors .NET's SerializeSessionAsync
+// ---------------------------------------------------------------------------
+
+/// A serializable snapshot of an [`AgentSession`].
+///
+/// Use [`AgentSession::serialize`] and [`AgentSession::deserialize`] to
+/// persist session state across process restarts or transfer between services.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SessionSnapshot {
+    pub session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub state: HashMap<String, serde_json::Value>,
+    pub history: Vec<Message>,
+}
+
+impl AgentSession {
+    /// Serialize the session to a JSON-compatible snapshot.
+    ///
+    /// Mirrors .NET's `SerializeSessionAsync()`.
+    pub async fn serialize(&self) -> AgentResult<SessionSnapshot> {
+        let history = self.get_history().await?;
+        Ok(SessionSnapshot {
+            session_id: self.session_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            state: self.state.clone(),
+            history,
+        })
+    }
+
+    /// Restore a session from a serialized snapshot.
+    ///
+    /// Mirrors .NET's `DeserializeSessionAsync()`.
+    pub async fn deserialize(snapshot: SessionSnapshot) -> AgentResult<Self> {
+        let session = Self {
+            session_id: snapshot.session_id,
+            conversation_id: snapshot.conversation_id,
+            state: snapshot.state,
+            history_provider: Box::new(InMemoryHistoryProvider::new()),
+        };
+        if !snapshot.history.is_empty() {
+            session.save_history(&snapshot.history).await?;
+        }
+        Ok(session)
+    }
+
+    /// Serialize the session to a JSON string.
+    pub async fn to_json(&self) -> AgentResult<String> {
+        let snapshot = self.serialize().await?;
+        serde_json::to_string(&snapshot).map_err(crate::error::AgentError::from)
+    }
+
+    /// Restore a session from a JSON string.
+    pub async fn from_json(json: &str) -> AgentResult<Self> {
+        let snapshot: SessionSnapshot =
+            serde_json::from_str(json).map_err(crate::error::AgentError::from)?;
+        Self::deserialize(snapshot).await
+    }
+}
+
 /// A provider for loading and persisting conversation history.
 ///
 /// Corresponds to Python's `HistoryProvider` protocol and .NET's `ChatHistoryProvider`.
@@ -105,17 +167,17 @@ pub struct InMemoryHistoryProvider {
 impl InMemoryHistoryProvider {
     /// Create a new empty in-memory history store with the default cap.
     pub fn new() -> Self {
-        Self::with_capacity(DEFAULT_MAX_HISTORY_MESSAGES)
+        Self::with_max_messages(Some(DEFAULT_MAX_HISTORY_MESSAGES))
     }
 
     /// Create a store with a specific per-session message cap.
     ///
-    /// A cap of `0` means "do not enforce any limit" — only use this for tests
+    /// `None` means "do not enforce any limit" — only use this for tests
     /// that must not lose messages.
-    pub fn with_capacity(max_messages: usize) -> Self {
+    pub fn with_max_messages(max_messages: Option<usize>) -> Self {
         Self {
             store: Arc::new(RwLock::new(HashMap::new())),
-            max_messages,
+            max_messages: max_messages.unwrap_or(0),
         }
     }
 }
@@ -189,7 +251,7 @@ mod tests {
 
     #[tokio::test]
     async fn fifo_eviction_keeps_latest_messages() {
-        let provider = InMemoryHistoryProvider::with_capacity(3);
+        let provider = InMemoryHistoryProvider::with_max_messages(Some(3));
         let sid = "s";
         for i in 0..5 {
             provider

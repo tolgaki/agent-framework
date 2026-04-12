@@ -72,7 +72,7 @@ let weather_tool = tool_fn(
             },
             "required": ["city"]
         }),
-    ),
+    )?,
     |args| async move {
         let city = args["city"].as_str().unwrap_or("unknown");
         Ok(serde_json::json!({ "temperature": 72, "city": city, "condition": "sunny" }))

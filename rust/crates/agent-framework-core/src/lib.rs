@@ -36,14 +36,18 @@
 
 pub mod agent;
 pub mod client;
+pub mod compaction;
 pub mod context;
+pub mod delegating;
 pub mod error;
 pub mod http_limits;
 pub mod middleware;
 pub mod redact;
 pub mod secret;
 pub mod session;
+pub mod skills;
 pub mod streaming;
+pub mod structured_output;
 pub mod tools;
 pub mod types;
 

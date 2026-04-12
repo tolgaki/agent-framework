@@ -13,6 +13,8 @@
 //! cargo run -p stream-agent
 //! ```
 
+use std::io::Write;
+
 use agent_framework_anthropic::{AnthropicChatClient, AnthropicConfig};
 use agent_framework_core::agent::{Agent, ChatClientAgent};
 use agent_framework_core::session::AgentSession;
@@ -47,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let update = update?;
         if let Some(text) = update.text {
             print!("{text}");
+            std::io::stdout().flush().ok();
         }
     }
     println!("\n\n--- Stream complete ---");

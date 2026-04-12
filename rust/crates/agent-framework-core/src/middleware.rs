@@ -93,13 +93,13 @@ pub trait ChatClientMiddleware: Send + Sync {
     ///
     /// The default implementation forwards directly to `next` without modification.
     /// Override to intercept streaming calls.
-    fn on_get_response_stream(
+    async fn on_get_response_stream(
         &self,
         messages: &mut Vec<Message>,
         options: &mut ChatOptions,
         next: &dyn ChatClient,
     ) -> AgentResult<ResponseStream> {
-        next.get_response_stream(messages, Some(options))
+        next.get_response_stream(messages, Some(options)).await
     }
 }
 
@@ -130,11 +130,16 @@ impl ChatClient for ChatClientDecorator {
             .await
     }
 
-    fn get_response_stream(&self, messages: &[Message], options: Option<&ChatOptions>) -> AgentResult<ResponseStream> {
+    async fn get_response_stream(
+        &self,
+        messages: &[Message],
+        options: Option<&ChatOptions>,
+    ) -> AgentResult<ResponseStream> {
         let mut msgs = messages.to_vec();
         let mut opts = options.cloned().unwrap_or_default();
         self.middleware
             .on_get_response_stream(&mut msgs, &mut opts, self.inner.as_ref())
+            .await
     }
 }
 

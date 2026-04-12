@@ -1,0 +1,20 @@
+[package]
+name = "agent-framework-devui"
+description = "Development UI server for the Microsoft Agent Framework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-framework-core.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread"] }
+tower.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+tokio-stream.workspace = true

@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use futures::stream::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, CONTENT_TYPE};
 use reqwest_eventsource::{Event, EventSource, RequestBuilderExt};
@@ -14,7 +16,7 @@ use tracing::debug;
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::error::{AgentError, AgentResult};
 use agent_framework_core::http_limits::DEFAULT_MAX_RESPONSE_BYTES;
-use agent_framework_core::redact::scrub_error_body;
+use agent_framework_core::redact::{scrub_error_body, MAX_ERROR_BODY_LEN};
 use agent_framework_core::secret::SecretString;
 use agent_framework_core::streaming::{AbortOnDrop, AbortingStream, ResponseStream};
 use agent_framework_core::types::{
@@ -219,7 +221,10 @@ impl ChatClient for AnthropicChatClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
+            // Use bounded read even for error bodies to prevent OOM from a
+            // hostile server at a custom base_url.
+            let error_bytes = read_bounded_body(response, MAX_ERROR_BODY_LEN).await.unwrap_or_default();
+            let error_text = String::from_utf8_lossy(&error_bytes);
             return Err(AgentError::provider(
                 format!("Anthropic API error ({status}): {}", scrub_error_body(&error_text)),
                 Some(status.as_u16()),
@@ -231,7 +236,7 @@ impl ChatClient for AnthropicChatClient {
         Ok(anthropic_response_to_chat_response(api_response))
     }
 
-    fn get_response_stream(&self, messages: &[Message], options: Option<&ChatOptions>) -> AgentResult<ResponseStream> {
+    async fn get_response_stream(&self, messages: &[Message], options: Option<&ChatOptions>) -> AgentResult<ResponseStream> {
         let mut body = self.build_request_body(messages, options)?;
         body.stream = Some(true);
         let url = format!("{}/v1/messages", self.config.base_url);
@@ -292,6 +297,8 @@ struct AnthropicMessage {
 enum AnthropicContent {
     #[serde(rename = "text")]
     Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: AnthropicImageSource },
     #[serde(rename = "tool_use")]
     ToolUse {
         id: String,
@@ -300,6 +307,19 @@ enum AnthropicContent {
     },
     #[serde(rename = "tool_result")]
     ToolResult { tool_use_id: String, content: String },
+}
+
+#[derive(Serialize, Deserialize, Clone)]
+struct AnthropicImageSource {
+    /// `"base64"` or `"url"`.
+    #[serde(rename = "type")]
+    source_type: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    url: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -346,11 +366,21 @@ fn message_to_anthropic(msg: &Message) -> AnthropicMessage {
                 tool_use_id: tool_call_id.clone(),
                 content: content.clone(),
             },
-            Content::Data { media_type, .. } => AnthropicContent::Text {
-                text: format!("[binary data: {media_type}]"),
+            Content::Data { data, media_type } => AnthropicContent::Image {
+                source: AnthropicImageSource {
+                    source_type: "base64".to_string(),
+                    media_type: Some(media_type.clone()),
+                    data: Some(BASE64_STANDARD.encode(data)),
+                    url: None,
+                },
             },
-            Content::Uri { uri, .. } => AnthropicContent::Text {
-                text: format!("[uri: {uri}]"),
+            Content::Uri { uri, media_type } => AnthropicContent::Image {
+                source: AnthropicImageSource {
+                    source_type: "url".to_string(),
+                    media_type: media_type.clone(),
+                    data: None,
+                    url: Some(uri.clone()),
+                },
             },
         })
         .collect();
@@ -452,7 +482,24 @@ fn handle_anthropic_event(
     blocks: &mut HashMap<u32, StreamBlockState>,
 ) -> AgentResult<Option<ChatResponseUpdate>> {
     match event_name {
-        "message_start" | "ping" | "content_block_stop" | "message_stop" => Ok(None),
+        "ping" | "content_block_stop" | "message_stop" => Ok(None),
+        "message_start" => {
+            // message_start carries input_tokens, which is only reported here.
+            let parsed: MessageStartEvent = serde_json::from_str(data)?;
+            if let Some(usage) = parsed.message.usage {
+                Ok(Some(ChatResponseUpdate {
+                    text: None,
+                    tool_call: None,
+                    finish_reason: None,
+                    usage: Some(Usage {
+                        input_tokens: usage.input_tokens.unwrap_or(0),
+                        output_tokens: usage.output_tokens.unwrap_or(0),
+                    }),
+                }))
+            } else {
+                Ok(None)
+            }
+        }
         "content_block_start" => {
             let parsed: BlockStartEvent = serde_json::from_str(data)?;
             match parsed.content_block {
@@ -565,6 +612,23 @@ fn handle_anthropic_event(
 }
 
 #[derive(Deserialize)]
+struct MessageStartEvent {
+    message: MessageStartMessage,
+}
+
+#[derive(Deserialize)]
+struct MessageStartMessage {
+    #[serde(default)]
+    usage: Option<MessageStartUsage>,
+}
+
+#[derive(Deserialize)]
+struct MessageStartUsage {
+    input_tokens: Option<u32>,
+    output_tokens: Option<u32>,
+}
+
+#[derive(Deserialize)]
 struct BlockStartEvent {
     index: u32,
     content_block: AnthropicContent,
@@ -632,6 +696,24 @@ fn anthropic_response_to_chat_response(resp: AnthropicResponse) -> ChatResponse 
             }
             AnthropicContent::ToolUse { id, name, input } => {
                 content_items.push(Content::tool_call(id, name, input.clone()));
+            }
+            AnthropicContent::Image { source } => {
+                // Images in responses are unusual (model output); preserve
+                // as Data content if base64, or Uri if URL-sourced.
+                if source.source_type == "base64" {
+                    if let Some(data) = &source.data {
+                        let decoded = BASE64_STANDARD.decode(data).unwrap_or_default();
+                        content_items.push(Content::Data {
+                            data: decoded,
+                            media_type: source.media_type.clone().unwrap_or_default(),
+                        });
+                    }
+                } else if let Some(url) = &source.url {
+                    content_items.push(Content::Uri {
+                        uri: url.clone(),
+                        media_type: source.media_type.clone(),
+                    });
+                }
             }
             AnthropicContent::ToolResult { .. } => {
                 // Tool results in response are unusual; skip.
@@ -728,7 +810,7 @@ mod tests {
 
         let client = make_client();
         let options = ChatOptions {
-            tools: vec![ToolDefinition::no_params("search", "Search the web")],
+            tools: vec![ToolDefinition::no_params("search", "Search the web").unwrap()],
             ..Default::default()
         };
         let body = client

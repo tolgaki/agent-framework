@@ -33,5 +33,9 @@ pub trait ChatClient: Send + Sync {
     ///
     /// # Errors
     /// Returns [`AgentError`](crate::error::AgentError) if the stream cannot be established.
-    fn get_response_stream(&self, messages: &[Message], options: Option<&ChatOptions>) -> AgentResult<ResponseStream>;
+    async fn get_response_stream(
+        &self,
+        messages: &[Message],
+        options: Option<&ChatOptions>,
+    ) -> AgentResult<ResponseStream>;
 }

@@ -6,6 +6,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::ToolDefinition;
 
+/// Serde helper that encodes `Vec<u8>` as a base64 string instead of a JSON
+/// integer array.  Keeps binary payloads compact (4/3× vs ~3-4× for `[u8]`).
+mod base64_serde {
+    use base64::engine::{general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(data: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(data))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let encoded = String::deserialize(d)?;
+        STANDARD.decode(encoded).map_err(serde::de::Error::custom)
+    }
+}
+
 /// The role of a message participant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -31,7 +47,11 @@ pub enum Content {
     Text { text: String },
 
     /// Binary data content with a media type.
-    Data { data: Vec<u8>, media_type: String },
+    Data {
+        #[serde(with = "base64_serde")]
+        data: Vec<u8>,
+        media_type: String,
+    },
 
     /// A URI reference to external content.
     Uri {

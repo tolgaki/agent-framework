@@ -13,7 +13,11 @@ pub enum AgentError {
 
     /// An error occurred in the LLM provider.
     #[error("Provider error: {message}")]
-    ProviderError { message: String, status_code: Option<u16> },
+    ProviderError {
+        message: String,
+        /// The HTTP status code, if available (typically 100–599).
+        status_code: Option<u16>,
+    },
 
     /// An error occurred during tool invocation.
     #[error("Tool invocation error for '{tool_name}': {message}")]

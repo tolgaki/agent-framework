@@ -5,6 +5,5 @@ edition = "2021"
 publish = false
 
 [dependencies]
-agent-framework-core = { path = "../../../crates/agent-framework-core" }
-agent-framework-anthropic = { path = "../../../crates/agent-framework-anthropic" }
+agent-framework = { path = "../../../crates/agent-framework" }
 tokio = { workspace = true, features = ["rt-multi-thread"] }

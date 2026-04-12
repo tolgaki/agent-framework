@@ -1,0 +1,10 @@
+[package]
+name = "hello-openai"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agent-framework-core.workspace = true
+agent-framework-openai.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

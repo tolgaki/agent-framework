@@ -4,6 +4,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+use base64::Engine;
 use futures::stream::StreamExt;
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use reqwest_eventsource::{Event, EventSource, RequestBuilderExt};
@@ -14,7 +16,7 @@ use tracing::debug;
 use agent_framework_core::client::ChatClient;
 use agent_framework_core::error::{AgentError, AgentResult};
 use agent_framework_core::http_limits::DEFAULT_MAX_RESPONSE_BYTES;
-use agent_framework_core::redact::scrub_error_body;
+use agent_framework_core::redact::{scrub_error_body, MAX_ERROR_BODY_LEN};
 use agent_framework_core::secret::SecretString;
 use agent_framework_core::streaming::{AbortOnDrop, AbortingStream, ResponseStream};
 use agent_framework_core::types::{
@@ -113,7 +115,7 @@ impl OpenAIChatClient {
 
         let max_tokens = options.and_then(|o| o.max_tokens).unwrap_or(self.config.max_tokens);
 
-        let api_messages: Vec<OpenAIMessage> = messages.iter().map(message_to_openai).collect();
+        let api_messages: Vec<OpenAIMessage> = messages.iter().flat_map(message_to_openai).collect();
 
         // Convert tool definitions (if any) to OpenAI's wire format.
         let tools: Option<Vec<OpenAITool>> = options.and_then(|o| {
@@ -209,7 +211,8 @@ impl ChatClient for OpenAIChatClient {
 
         let status = response.status();
         if !status.is_success() {
-            let error_text = response.text().await.unwrap_or_default();
+            let error_bytes = read_bounded_body(response, MAX_ERROR_BODY_LEN).await.unwrap_or_default();
+            let error_text = String::from_utf8_lossy(&error_bytes);
             return Err(AgentError::provider(
                 format!("OpenAI API error ({status}): {}", scrub_error_body(&error_text)),
                 Some(status.as_u16()),
@@ -221,7 +224,7 @@ impl ChatClient for OpenAIChatClient {
         Ok(openai_response_to_chat_response(api_response))
     }
 
-    fn get_response_stream(&self, messages: &[Message], options: Option<&ChatOptions>) -> AgentResult<ResponseStream> {
+    async fn get_response_stream(&self, messages: &[Message], options: Option<&ChatOptions>) -> AgentResult<ResponseStream> {
         let mut body = self.build_request_body(messages, options);
         body.stream = Some(true);
         // Ask OpenAI to include usage in the final chunk.
@@ -284,8 +287,10 @@ struct StreamOptions {
 #[derive(Serialize)]
 struct OpenAIMessage {
     role: String,
+    /// Content can be a JSON string, an array of content parts (for multimodal),
+    /// or null. Using `serde_json::Value` covers all three cases.
     #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
+    content: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_calls: Option<Vec<OpenAIToolCall>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -347,13 +352,44 @@ struct OpenAIUsage {
 
 // ---- Conversion functions ----
 
-fn message_to_openai(msg: &Message) -> OpenAIMessage {
+fn message_to_openai(msg: &Message) -> Vec<OpenAIMessage> {
     let role = match msg.role {
         Role::System => "system",
         Role::User => "user",
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     };
+
+    // Tool-role messages: OpenAI requires one message per tool_call_id.
+    // Emit a separate OpenAIMessage for each ToolResult.
+    if msg.role == Role::Tool {
+        let results: Vec<_> = msg
+            .content
+            .iter()
+            .filter_map(|c| {
+                if let Content::ToolResult { tool_call_id, content } = c {
+                    Some(OpenAIMessage {
+                        role: "tool".to_string(),
+                        content: Some(serde_json::Value::String(content.clone())),
+                        tool_calls: None,
+                        tool_call_id: Some(tool_call_id.clone()),
+                    })
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !results.is_empty() {
+            return results;
+        }
+        // Fallback: tool message with no ToolResult content.
+        return vec![OpenAIMessage {
+            role: "tool".to_string(),
+            content: None,
+            tool_calls: None,
+            tool_call_id: None,
+        }];
+    }
 
     // Collect tool calls from assistant messages.
     let tool_calls: Vec<_> = msg
@@ -375,40 +411,42 @@ fn message_to_openai(msg: &Message) -> OpenAIMessage {
         })
         .collect();
 
-    // For tool messages, extract the tool_call_id and the result content.
-    // OpenAI requires both fields on a `tool`-role message.
-    let (tool_call_id, tool_result_content) = msg
-        .content
-        .iter()
-        .find_map(|c| {
-            if let Content::ToolResult { tool_call_id, content } = c {
-                Some((Some(tool_call_id.clone()), Some(content.clone())))
-            } else {
-                None
-            }
-        })
-        .unwrap_or((None, None));
-
-    // Build the content field. Tool messages use the tool_result text;
-    // other roles use the concatenated text content.
-    let content = match msg.role {
-        Role::Tool => tool_result_content,
-        _ => {
-            let text = msg.text();
-            if text.is_empty() {
-                None
-            } else {
-                Some(text)
-            }
+    // Build the content field. Use an array of content parts if the message
+    // contains multimodal items (images), otherwise a plain string.
+    let has_multimodal = msg.content.iter().any(|c| matches!(c, Content::Data { .. } | Content::Uri { .. }));
+    let content = if has_multimodal {
+        let parts: Vec<serde_json::Value> = msg
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                Content::Text { text } => Some(serde_json::json!({"type": "text", "text": text})),
+                Content::Data { data, media_type } => {
+                    let b64 = BASE64_STANDARD.encode(data);
+                    let data_url = format!("data:{media_type};base64,{b64}");
+                    Some(serde_json::json!({"type": "image_url", "image_url": {"url": data_url}}))
+                }
+                Content::Uri { uri, .. } => {
+                    Some(serde_json::json!({"type": "image_url", "image_url": {"url": uri}}))
+                }
+                _ => None,
+            })
+            .collect();
+        if parts.is_empty() {
+            None
+        } else {
+            Some(serde_json::Value::Array(parts))
         }
+    } else {
+        let text = msg.text();
+        if text.is_empty() { None } else { Some(serde_json::Value::String(text)) }
     };
 
-    OpenAIMessage {
+    vec![OpenAIMessage {
         role: role.to_string(),
         content,
         tool_calls: if tool_calls.is_empty() { None } else { Some(tool_calls) },
-        tool_call_id,
-    }
+        tool_call_id: None,
+    }]
 }
 
 /// Read an HTTP response body into memory with a hard byte cap.
@@ -495,7 +533,7 @@ fn handle_openai_chunk(
 
     // Usage arrives on the final chunk (when stream_options.include_usage=true).
     // That chunk has an empty `choices` array, so handle it before the choice loop.
-    if let Some(usage) = chunk.usage.clone() {
+    if let Some(usage) = chunk.usage {
         updates.push(ChatResponseUpdate {
             text: None,
             tool_call: None,
@@ -671,14 +709,31 @@ mod tests {
 
     #[test]
     fn tool_role_message_populates_content_field() {
-        // Regression: msg.text() only extracts Content::Text, so tool-result
-        // messages used to serialize with content: null.
         let msg = Message::tool_result("call_123", "the sky is blue");
-        let oa = message_to_openai(&msg);
+        let msgs = message_to_openai(&msg);
+        assert_eq!(msgs.len(), 1);
+        let oa = &msgs[0];
         assert_eq!(oa.role, "tool");
         assert_eq!(oa.tool_call_id.as_deref(), Some("call_123"));
-        assert_eq!(oa.content.as_deref(), Some("the sky is blue"));
+        assert_eq!(oa.content.as_ref().and_then(|v| v.as_str()), Some("the sky is blue"));
         assert!(oa.tool_calls.is_none());
+    }
+
+    #[test]
+    fn multiple_tool_results_produce_multiple_messages() {
+        let msg = Message {
+            role: Role::Tool,
+            content: vec![
+                Content::tool_result("call_1", "result_1"),
+                Content::tool_result("call_2", "result_2"),
+            ],
+            name: None,
+            metadata: HashMap::new(),
+        };
+        let msgs = message_to_openai(&msg);
+        assert_eq!(msgs.len(), 2);
+        assert_eq!(msgs[0].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(msgs[1].tool_call_id.as_deref(), Some("call_2"));
     }
 
     #[test]
@@ -692,10 +747,12 @@ mod tests {
             name: None,
             metadata: HashMap::new(),
         };
-        let oa = message_to_openai(&msg);
+        let msgs = message_to_openai(&msg);
+        assert_eq!(msgs.len(), 1);
+        let oa = &msgs[0];
         assert_eq!(oa.role, "assistant");
-        assert_eq!(oa.content.as_deref(), Some("let me check"));
-        let calls = oa.tool_calls.expect("tool_calls should be present");
+        assert_eq!(oa.content.as_ref().and_then(|v| v.as_str()), Some("let me check"));
+        let calls = oa.tool_calls.as_ref().expect("tool_calls should be present");
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].id, "call_1");
         assert_eq!(calls[0].function.name, "get_weather");
@@ -705,9 +762,11 @@ mod tests {
     #[test]
     fn user_message_text_goes_to_content() {
         let msg = Message::user("hello");
-        let oa = message_to_openai(&msg);
+        let msgs = message_to_openai(&msg);
+        assert_eq!(msgs.len(), 1);
+        let oa = &msgs[0];
         assert_eq!(oa.role, "user");
-        assert_eq!(oa.content.as_deref(), Some("hello"));
+        assert_eq!(oa.content.as_ref().and_then(|v| v.as_str()), Some("hello"));
         assert!(oa.tool_calls.is_none());
         assert!(oa.tool_call_id.is_none());
     }
@@ -727,7 +786,7 @@ mod tests {
         let client = OpenAIChatClient::new(config).expect("client builds in tests");
 
         let options = ChatOptions {
-            tools: vec![ToolDefinition::no_params("ping", "Ping")],
+            tools: vec![ToolDefinition::no_params("ping", "Ping").unwrap()],
             ..Default::default()
         };
 

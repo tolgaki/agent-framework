@@ -14,9 +14,9 @@ use crate::middleware::{
 };
 use crate::session::AgentSession;
 use crate::streaming::AgentResponseStream;
-use crate::tools::{FunctionTool, ToolDefinition};
+use crate::tools::FunctionTool;
 use crate::types::{
-    AgentResponse, AgentResponseUpdate, AgentRunOptions, ChatOptions, Content, FinishReason, Message, Role,
+    AgentResponse, AgentResponseUpdate, AgentRunOptions, ChatOptions, Content, FinishReason, Message, Role, Usage,
 };
 
 /// The core agent trait.
@@ -49,6 +49,11 @@ pub trait Agent: Send + Sync {
     ///
     /// The returned stream borrows from `self` and `session` and must be
     /// fully consumed (or dropped) before either can be used again.
+    ///
+    /// **Note:** Agent-level middleware is NOT applied during streaming because
+    /// [`AgentMiddleware::on_run`] returns an `AgentResponse` (not a stream).
+    /// Chat-client middleware and function middleware are still applied.
+    /// Use [`run`](Self::run) if you need agent-level middleware guarantees.
     fn run_stream<'a>(
         &'a self,
         messages: Vec<Message>,
@@ -102,11 +107,6 @@ impl ChatClientAgent {
         ChatClientAgentBuilder::default()
     }
 
-    /// Get the tool definitions for all registered tools.
-    fn tool_definitions(&self) -> Vec<ToolDefinition> {
-        self.tools.iter().map(|t| t.definition().clone()).collect()
-    }
-
     /// Find a tool by name.
     fn find_tool(&self, name: &str) -> Option<&dyn FunctionTool> {
         self.tools
@@ -115,14 +115,16 @@ impl ChatClientAgent {
             .map(|t| t.as_ref())
     }
 
-    /// Build the full message list including system instructions and context.
-    async fn build_messages(
+    /// Build the full message list including system instructions and context,
+    /// and collect any tools injected by context providers.
+    async fn build_messages_and_context(
         &self,
         input_messages: &[Message],
         session: &AgentSession,
         additional_instructions: Option<&str>,
-    ) -> AgentResult<Vec<Message>> {
+    ) -> AgentResult<(Vec<Box<dyn FunctionTool>>, Vec<Message>)> {
         let mut messages = Vec::new();
+        let mut context_tools: Vec<Box<dyn FunctionTool>> = Vec::new();
 
         // Add system instructions.
         if let Some(instructions) = &self.instructions {
@@ -143,6 +145,7 @@ impl ChatClientAgent {
                 messages.push(Message::system(instructions));
             }
             messages.extend(context.messages);
+            context_tools.extend(context.tools);
         }
 
         // Add conversation history.
@@ -152,20 +155,73 @@ impl ChatClientAgent {
         // Add input messages.
         messages.extend(input_messages.iter().cloned());
 
-        Ok(messages)
+        Ok((context_tools, messages))
     }
 
     /// Build the effective ChatOptions for one run by layering per-call
-    /// overrides onto the agent's default options, then attaching tools.
-    fn effective_options(&self, per_call: Option<&AgentRunOptions>) -> ChatOptions {
+    /// overrides onto the agent's default options, then attaching tool
+    /// definitions (agent-level + context-provided), deduplicating by name.
+    fn effective_options(
+        &self,
+        per_call: Option<&AgentRunOptions>,
+        context_tools: &[Box<dyn FunctionTool>],
+    ) -> ChatOptions {
         let mut options = match per_call.and_then(|o| o.chat_options.as_ref()) {
             Some(overrides) => self.options.merge(overrides),
             None => self.options.clone(),
         };
-        if !self.tools.is_empty() {
-            options.tools.extend(self.tool_definitions());
+
+        // Collect all tool definitions: agent tools + context tools.
+        let mut seen = std::collections::HashSet::new();
+        // Keep any already in options (from per-call overrides).
+        for t in &options.tools {
+            seen.insert(t.name.clone());
+        }
+        for t in &self.tools {
+            let def = t.definition();
+            if seen.insert(def.name.clone()) {
+                options.tools.push(def.clone());
+            }
+        }
+        for t in context_tools {
+            let def = t.definition();
+            if seen.insert(def.name.clone()) {
+                options.tools.push(def.clone());
+            }
         }
         options
+    }
+
+    /// Invoke a tool by name through the function middleware chain.
+    /// Checks both agent-owned tools and dynamically injected context tools.
+    async fn invoke_tool(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        context_tools: &[Box<dyn FunctionTool>],
+    ) -> String {
+        let tool = self.find_tool(name).or_else(|| {
+            context_tools
+                .iter()
+                .find(|t| t.definition().name == name)
+                .map(|t| t.as_ref())
+        });
+        match tool {
+            Some(tool) => {
+                let chain = FunctionChain {
+                    remaining: &self.function_middleware,
+                    tool,
+                };
+                match chain.invoke(args).await {
+                    Ok(value) => match serde_json::to_string(&value) {
+                        Ok(s) => s,
+                        Err(e) => format!("Error: serialization failed: {e}"),
+                    },
+                    Err(e) => format!("Error: {e}"),
+                }
+            }
+            None => format!("Error: unknown tool '{name}'"),
+        }
     }
 
     /// Execute the tool-call loop: call model, handle tool calls, repeat.
@@ -177,14 +233,22 @@ impl ChatClientAgent {
         run_options: Option<&AgentRunOptions>,
     ) -> AgentResult<AgentResponse> {
         let additional = run_options.and_then(|o| o.additional_instructions.as_deref());
-        let mut all_messages = self.build_messages(&input_messages, session, additional).await?;
+        let (context_tools, mut all_messages) =
+            self.build_messages_and_context(&input_messages, session, additional).await?;
         let mut accumulated_messages = Vec::new();
-        let options = self.effective_options(run_options);
+        let options = self.effective_options(run_options, &context_tools);
+        let mut total_usage = Usage::default();
 
         for round in 0..self.max_tool_rounds {
             debug!(round, "Invoking chat client");
 
             let response = self.client.get_response(&all_messages, Some(&options)).await?;
+
+            // Accumulate usage across all model calls.
+            if let Some(u) = &response.usage {
+                total_usage.input_tokens += u.input_tokens;
+                total_usage.output_tokens += u.output_tokens;
+            }
 
             // Collect assistant messages.
             accumulated_messages.extend(response.messages.clone());
@@ -198,13 +262,14 @@ impl ChatClientAgent {
                 .collect();
 
             if tool_calls.is_empty() || response.finish_reason != Some(FinishReason::ToolUse) {
-                // No tool calls or model is done — return the response.
-                // Save to history.
-                let mut history_messages = input_messages.clone();
+                // No tool calls or model is done — save to history and return.
+                let mut history_messages = input_messages;
                 history_messages.extend(accumulated_messages.clone());
                 session.save_history(&history_messages).await?;
 
-                return Ok(AgentResponse::from_chat_response(response, accumulated_messages));
+                let mut agent_response = AgentResponse::from_chat_response(response, accumulated_messages);
+                agent_response.usage = Some(total_usage);
+                return Ok(agent_response);
             }
 
             // Add assistant messages (with tool calls) to the conversation.
@@ -213,19 +278,7 @@ impl ChatClientAgent {
             // Execute tool calls (each wrapped in function middleware).
             for (id, name, args) in tool_calls {
                 debug!(tool = %name, "Invoking tool");
-                let result = match self.find_tool(&name) {
-                    Some(tool) => {
-                        let chain = FunctionChain {
-                            remaining: &self.function_middleware,
-                            tool,
-                        };
-                        match chain.invoke(args).await {
-                            Ok(value) => serde_json::to_string(&value).map_err(AgentError::from)?,
-                            Err(e) => format!("Error: {e}"),
-                        }
-                    }
-                    None => format!("Error: unknown tool '{name}'"),
-                };
+                let result = self.invoke_tool(&name, args, &context_tools).await;
 
                 let tool_msg = Message {
                     role: Role::Tool,
@@ -316,19 +369,17 @@ impl ChatClientAgent {
         run_options: Option<&'a AgentRunOptions>,
     ) -> AgentResult<AgentResponseStream<'a>> {
         let stream = async_stream::try_stream! {
-            // Seed the conversation the same way execute_run does.
             let additional = run_options.and_then(|o| o.additional_instructions.as_deref());
-            let mut all_messages = self.build_messages(&input_messages, session, additional).await?;
+            let (context_tools, mut all_messages) =
+                self.build_messages_and_context(&input_messages, session, additional).await?;
             let mut accumulated_messages: Vec<Message> = Vec::new();
-
-            let options = self.effective_options(run_options);
+            let options = self.effective_options(run_options, &context_tools);
 
             for round in 0..self.max_tool_rounds {
                 debug!(round, "Opening chat stream");
 
-                let mut provider_stream = self.client.get_response_stream(&all_messages, Some(&options))?;
+                let mut provider_stream = self.client.get_response_stream(&all_messages, Some(&options)).await?;
 
-                // Accumulators for reconstructing a full ChatResponse at stream end.
                 let mut accumulated_text = String::new();
                 let mut tool_accumulators: Vec<StreamingToolCall> = Vec::new();
                 let mut final_finish_reason: Option<FinishReason> = None;
@@ -346,8 +397,6 @@ impl ChatClientAgent {
                         final_finish_reason = Some(reason);
                     }
 
-                    // Cap total accumulated streaming state. A hostile provider
-                    // could otherwise drive us OOM via unbounded text or args.
                     let state_bytes = accumulated_text.len()
                         + tool_accumulators.iter().map(|t| t.id.len() + t.name.len() + t.arguments.len()).sum::<usize>();
                     if state_bytes > DEFAULT_MAX_STREAM_STATE_BYTES {
@@ -357,19 +406,16 @@ impl ChatClientAgent {
                         )))?;
                     }
 
-                    // Forward the provider update to the caller.
                     yield AgentResponseUpdate {
                         text: update.text.clone(),
                         inner: update,
                     };
                 }
 
-                // Reconstruct the assistant message(s) produced this round.
                 let assistant_msg = build_assistant_message(&accumulated_text, &tool_accumulators);
                 accumulated_messages.push(assistant_msg.clone());
                 all_messages.push(assistant_msg);
 
-                // If the model isn't asking for tools, we're done.
                 let has_tool_calls = !tool_accumulators.is_empty();
                 if !has_tool_calls || final_finish_reason != Some(FinishReason::ToolUse) {
                     let mut history_messages = input_messages.clone();
@@ -380,25 +426,9 @@ impl ChatClientAgent {
 
                 // Execute tool calls through the function middleware chain.
                 for tc in tool_accumulators {
-                    // If the model emitted malformed JSON, surface a ToolError
-                    // back to it as the tool result rather than silently invoking
-                    // with Null — tools commonly do `args["x"].as_str()` and
-                    // produce wrong results when args are Null.
                     let result = match serde_json::from_str::<serde_json::Value>(&tc.arguments) {
                         Err(e) => format!("Error: invalid JSON arguments: {e}"),
-                        Ok(args) => match self.find_tool(&tc.name) {
-                            Some(tool) => {
-                                let chain = FunctionChain {
-                                    remaining: &self.function_middleware,
-                                    tool,
-                                };
-                                match chain.invoke(args).await {
-                                    Ok(value) => serde_json::to_string(&value).map_err(AgentError::from)?,
-                                    Err(e) => format!("Error: {e}"),
-                                }
-                            }
-                            None => format!("Error: unknown tool '{}'", tc.name),
-                        },
+                        Ok(args) => self.invoke_tool(&tc.name, args, &context_tools).await,
                     };
 
                     let tool_msg = Message {
@@ -432,19 +462,30 @@ struct StreamingToolCall {
 }
 
 fn push_tool_call_delta(acc: &mut Vec<StreamingToolCall>, delta: &crate::types::ToolCallUpdate) {
-    // Match by id when possible, otherwise by position of the last entry.
-    if let Some(existing) = acc.iter_mut().find(|t| t.id == delta.id && !delta.id.is_empty()) {
+    // Match by id when available.
+    if !delta.id.is_empty() {
+        if let Some(existing) = acc.iter_mut().find(|t| t.id == delta.id) {
+            if existing.name.is_empty() && !delta.name.is_empty() {
+                existing.name = delta.name.clone();
+            }
+            existing.arguments.push_str(&delta.arguments_delta);
+            return;
+        }
+    } else if let Some(existing) = acc.last_mut() {
+        // Positional fallback: when id is empty (e.g., continuation chunks
+        // from some providers), append to the most recently added accumulator.
         if existing.name.is_empty() && !delta.name.is_empty() {
             existing.name = delta.name.clone();
         }
         existing.arguments.push_str(&delta.arguments_delta);
-    } else {
-        acc.push(StreamingToolCall {
-            id: delta.id.clone(),
-            name: delta.name.clone(),
-            arguments: delta.arguments_delta.clone(),
-        });
+        return;
     }
+    // No match — start a new accumulator.
+    acc.push(StreamingToolCall {
+        id: delta.id.clone(),
+        name: delta.name.clone(),
+        arguments: delta.arguments_delta.clone(),
+    });
 }
 
 fn build_assistant_message(text: &str, tools: &[StreamingToolCall]) -> Message {
@@ -604,7 +645,7 @@ mod tests {
             Ok(self.response.clone())
         }
 
-        fn get_response_stream(
+        async fn get_response_stream(
             &self,
             _messages: &[Message],
             _options: Option<&ChatOptions>,
@@ -672,7 +713,7 @@ mod tests {
             }
             Ok(r.remove(0))
         }
-        fn get_response_stream(
+        async fn get_response_stream(
             &self,
             _: &[Message],
             _: Option<&ChatOptions>,
@@ -732,7 +773,8 @@ mod tests {
                 "echo",
                 "Echo input",
                 serde_json::json!({"type":"object","properties":{"msg":{"type":"string"}}}),
-            ),
+            )
+            .unwrap(),
             |args| async move { Ok(serde_json::json!({ "echoed": args["msg"] })) },
         );
 
@@ -860,7 +902,7 @@ mod tests {
             *self.captured.lock().unwrap() = messages.to_vec();
             Ok(self.response.clone())
         }
-        fn get_response_stream(
+        async fn get_response_stream(
             &self,
             _: &[Message],
             _: Option<&ChatOptions>,
@@ -923,7 +965,7 @@ mod tests {
             Err(AgentError::Unimplemented("non-stream".into()))
         }
 
-        fn get_response_stream(&self, _: &[Message], _: Option<&ChatOptions>) -> AgentResult<ResponseStream> {
+        async fn get_response_stream(&self, _: &[Message], _: Option<&ChatOptions>) -> AgentResult<ResponseStream> {
             let mut scripts = self.scripts.lock().unwrap();
             if scripts.is_empty() {
                 return Err(AgentError::InvalidResponse("no scripted stream left".into()));
@@ -987,7 +1029,8 @@ mod tests {
                 "echo",
                 "Echo",
                 serde_json::json!({"type":"object","properties":{"msg":{"type":"string"}}}),
-            ),
+            )
+            .unwrap(),
             |args| async move { Ok(serde_json::json!({ "echoed": args["msg"] })) },
         );
 
@@ -1025,7 +1068,7 @@ mod tests {
             *self.captured.lock().unwrap() = options.cloned();
             Ok(self.response.clone())
         }
-        fn get_response_stream(
+        async fn get_response_stream(
             &self,
             _: &[Message],
             _: Option<&ChatOptions>,

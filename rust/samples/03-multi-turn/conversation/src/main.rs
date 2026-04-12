@@ -15,7 +15,7 @@
 use agent_framework_anthropic::{AnthropicChatClient, AnthropicConfig};
 use agent_framework_core::agent::{Agent, ChatClientAgent};
 use agent_framework_core::session::AgentSession;
-use agent_framework_core::types::Message;
+use agent_framework_core::types::{AgentRunOptions, Message};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,12 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     println!("Assistant: {}\n", r2.text);
 
-    // Turn 3 — demonstrate per-call instruction override.
+    // Turn 3 — demonstrate per-call instruction override via AgentRunOptions.
+    let opts = AgentRunOptions::new().with_additional_instructions("Respond in exactly one sentence.");
     let r3 = agent
         .run(
             vec![Message::user("Summarize our conversation so far.")],
             &mut session,
-            None,
+            Some(&opts),
         )
         .await?;
     println!("Assistant: {}", r3.text);

@@ -3,7 +3,7 @@
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
-use crate::error::AgentResult;
+use crate::error::{AgentError, AgentResult};
 
 /// The JSON Schema definition for a tool's parameters.
 ///
@@ -23,25 +23,50 @@ pub struct ToolDefinition {
 
 impl ToolDefinition {
     /// Create a new tool definition.
-    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters_schema: serde_json::Value) -> Self {
-        Self {
-            name: name.into(),
+    ///
+    /// # Errors
+    /// Returns [`AgentError::InvalidRequest`] if `name` does not match `[a-zA-Z0-9_-]+`.
+    pub fn new(
+        name: impl Into<String>,
+        description: impl Into<String>,
+        parameters_schema: serde_json::Value,
+    ) -> AgentResult<Self> {
+        let name = name.into();
+        validate_tool_name(&name)?;
+        Ok(Self {
+            name,
             description: description.into(),
             parameters_schema,
-        }
+        })
     }
 
     /// Create a tool definition with no parameters.
-    pub fn no_params(name: impl Into<String>, description: impl Into<String>) -> Self {
-        Self {
-            name: name.into(),
+    ///
+    /// # Errors
+    /// Returns [`AgentError::InvalidRequest`] if `name` does not match `[a-zA-Z0-9_-]+`.
+    pub fn no_params(name: impl Into<String>, description: impl Into<String>) -> AgentResult<Self> {
+        let name = name.into();
+        validate_tool_name(&name)?;
+        Ok(Self {
+            name,
             description: description.into(),
             parameters_schema: serde_json::json!({
                 "type": "object",
                 "properties": {},
+                "additionalProperties": false,
             }),
-        }
+        })
     }
+}
+
+/// Validate that a tool name contains only `[a-zA-Z0-9_-]` and is non-empty.
+fn validate_tool_name(name: &str) -> AgentResult<()> {
+    if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-') {
+        return Err(AgentError::InvalidRequest(format!(
+            "tool name must match [a-zA-Z0-9_-]+, got: {name:?}"
+        )));
+    }
+    Ok(())
 }
 
 /// A tool that can be invoked by an agent during a conversation.
@@ -99,7 +124,7 @@ pub struct ClosureTool<F> {
 /// ```rust
 /// use agent_framework_core::tools::{tool_fn, ToolDefinition};
 ///
-/// let def = ToolDefinition::no_params("greet", "Say hello");
+/// let def = ToolDefinition::no_params("greet", "Say hello").unwrap();
 /// let tool = tool_fn(def, |_args| async {
 ///     Ok(serde_json::json!("Hello!"))
 /// });

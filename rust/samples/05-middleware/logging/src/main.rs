@@ -86,7 +86,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
                 "required": ["expression"]
             }),
-        ),
+        )?,
         |args| async move {
             let expr = args["expression"].as_str().unwrap_or("0");
             // Toy evaluation — in a real app, use a proper math parser.
