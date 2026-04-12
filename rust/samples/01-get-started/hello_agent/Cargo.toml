@@ -1,0 +1,9 @@
+[package]
+name = "hello-agent"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+agent-framework = { path = "../../../crates/agent-framework" }
+tokio = { workspace = true, features = ["rt-multi-thread"] }

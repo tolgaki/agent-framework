@@ -1,0 +1,142 @@
+[package]
+name = "agent-framework"
+description = "Microsoft Agent Framework for Rust - build, orchestrate, and deploy AI agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-framework-core.workspace = true
+
+[features]
+default = ["anthropic", "openai"]
+anthropic = ["dep:agent-framework-anthropic"]
+openai = ["dep:agent-framework-openai"]
+azure-openai = ["openai", "agent-framework-openai/azure"]
+ollama = ["dep:agent-framework-ollama"]
+evaluation = ["dep:agent-framework-evaluation"]
+telemetry = ["dep:agent-framework-telemetry"]
+mcp = ["dep:agent-framework-mcp"]
+workflows = ["dep:agent-framework-workflows"]
+orchestrations = ["dep:agent-framework-orchestrations"]
+declarative = ["dep:agent-framework-declarative"]
+cosmos = ["dep:agent-framework-cosmos"]
+redis = ["dep:agent-framework-redis"]
+a2a = ["dep:agent-framework-a2a"]
+hosting = ["dep:agent-framework-hosting"]
+devui = ["dep:agent-framework-devui"]
+agui = ["dep:agent-framework-agui"]
+purview = ["dep:agent-framework-purview"]
+foundry = ["dep:agent-framework-foundry"]
+azure-persistent = ["dep:agent-framework-azure-persistent"]
+copilot-studio = ["dep:agent-framework-copilot-studio"]
+github-copilot = ["dep:agent-framework-github-copilot"]
+mem0 = ["dep:agent-framework-mem0"]
+durabletask = ["dep:agent-framework-durabletask"]
+hosting-azfunc = ["hosting", "dep:agent-framework-hosting-azfunc"]
+workflows-declarative = ["workflows", "dep:agent-framework-workflows-declarative"]
+all = [
+    "anthropic", "openai", "azure-openai", "ollama",
+    "evaluation", "telemetry", "mcp",
+    "workflows", "orchestrations", "declarative",
+    "cosmos", "redis", "a2a", "hosting", "devui", "agui", "purview",
+    "foundry", "azure-persistent", "copilot-studio", "github-copilot",
+    "mem0", "durabletask", "hosting-azfunc", "workflows-declarative",
+]
+
+[dependencies.agent-framework-anthropic]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-openai]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-ollama]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-evaluation]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-telemetry]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-mcp]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-workflows]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-orchestrations]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-declarative]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-cosmos]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-redis]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-a2a]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-hosting]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-devui]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-agui]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-purview]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-foundry]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-azure-persistent]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-copilot-studio]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-github-copilot]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-mem0]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-durabletask]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-hosting-azfunc]
+workspace = true
+optional = true
+
+[dependencies.agent-framework-workflows-declarative]
+workspace = true
+optional = true

@@ -1,0 +1,14 @@
+[package]
+name = "agent-framework-telemetry"
+description = "OpenTelemetry instrumentation for the Microsoft Agent Framework"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+agent-framework-core.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+serde_json.workspace = true
